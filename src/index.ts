@@ -4,25 +4,72 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema, GetPromptRequestSchema, ListPromptsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { spawn, ChildProcess, SpawnOptions } from 'child_process'
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
 
-interface Tunnel {
-  process: ChildProcess
-  url: string
+// ---- State persistence ----
+
+const SIDEDOOR_DIR = join(homedir(), '.sidedoor')
+const STATE_FILE = join(SIDEDOOR_DIR, 'mcp-state.json')
+
+interface PersistedTunnel {
   port: number
+  url: string
+  pid: number
 }
 
-interface ServerAndTunnel {
-  serverProcess: ChildProcess
-  tunnelProcess: ChildProcess
-  url: string
-  port: number
+function findBinary(): string {
+  const ext = process.platform === 'win32' ? '.exe' : ''
+  const direct = join(SIDEDOOR_DIR, 'bin', `sidedoor${ext}`)
+  if (existsSync(direct)) return direct
+  return 'sidedoor'
 }
 
-const tunnels = new Map<number, Tunnel>()
-const serverTunnels = new Map<number, ServerAndTunnel>()
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
 
+function saveState() {
+  try {
+    mkdirSync(SIDEDOOR_DIR, { recursive: true })
+    const state: PersistedTunnel[] = []
+    for (const [port, t] of activeTunnels) {
+      if (t.pid) state.push({ port, url: t.url, pid: t.pid })
+    }
+    writeFileSync(STATE_FILE, JSON.stringify(state))
+  } catch {}
+}
+
+function loadState() {
+  try {
+    const raw = readFileSync(STATE_FILE, 'utf8')
+    const state: PersistedTunnel[] = JSON.parse(raw)
+    for (const t of state) {
+      if (isAlive(t.pid)) {
+        activeTunnels.set(t.port, { pid: t.pid, url: t.url, port: t.port, process: null })
+      }
+    }
+    saveState()
+  } catch {}
+}
+
+// ---- Tunnel tracking ----
+
+interface ActiveTunnel {
+  pid: number
+  url: string
+  port: number
+  process: ChildProcess | null
+}
+
+const activeTunnels = new Map<number, ActiveTunnel>()
 const MAX_TUNNELS = Number(process.env.SIDEDOOR_MAX_TUNNELS ?? 1)
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+loadState()
+
+// ---- MCP server ----
 
 const server = new Server(
   { name: 'sidedoor', version: '0.1.0' },
@@ -59,15 +106,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'share_port',
-      description:
-        'Share a local port publicly using sidedoor. Returns the public URL. Use this when the user wants to share their app, expose localhost, or give someone a link to their running dev server.',
+      description: 'Share a local port publicly using sidedoor. Returns the public URL. Use this when the user wants to share their app, expose localhost, or give someone a link to their running dev server.',
       inputSchema: {
         type: 'object',
         properties: {
-          port: {
-            type: 'number',
-            description: 'The local port to share (e.g. 3000, 5173, 8080)',
-          },
+          port: { type: 'number', description: 'The local port to share (e.g. 3000, 5173, 8080)' },
         },
         required: ['port'],
       },
@@ -78,10 +121,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          port: {
-            type: 'number',
-            description: 'The port to stop sharing',
-          },
+          port: { type: 'number', description: 'The port to stop sharing' },
         },
         required: ['port'],
       },
@@ -89,38 +129,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'stop_all',
       description: 'Stop all active sidedoor tunnels.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-      },
+      inputSchema: { type: 'object', properties: {} },
     },
     {
       name: 'list_tunnels',
       description: 'List all currently active sidedoor tunnels and their public URLs.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-      },
+      inputSchema: { type: 'object', properties: {} },
     },
     {
       name: 'start_server_and_tunnel',
-      description:
-        'Start a local dev server with a shell command AND immediately expose it publicly via sidedoor. Returns the public URL. Use this when the user wants to run their app and share it in one step — e.g. "start my app and give me a shareable link".',
+      description: 'Start a local dev server with a shell command AND immediately expose it publicly via sidedoor. Returns the public URL. Use this when the user wants to run their app and share it in one step.',
       inputSchema: {
         type: 'object',
         properties: {
-          command: {
-            type: 'string',
-            description: 'Shell command to start the local server (e.g. "npm run dev", "python -m http.server 8000")',
-          },
-          port: {
-            type: 'number',
-            description: 'The port the server will listen on',
-          },
-          wait_ms: {
-            type: 'number',
-            description: 'Milliseconds to wait for the server to start before opening the tunnel (default: 2000)',
-          },
+          command: { type: 'string', description: 'Shell command to start the local server (e.g. "npm run dev")' },
+          port: { type: 'number', description: 'The port the server will listen on' },
+          wait_ms: { type: 'number', description: 'Milliseconds to wait for the server to start before opening the tunnel (default: 2000)' },
         },
         required: ['command', 'port'],
       },
@@ -135,87 +159,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'share_port': {
       const port = args?.port as number
 
-      if (tunnels.has(port) || serverTunnels.has(port)) {
-        const existing = tunnels.get(port) || serverTunnels.get(port)!
+      const existing = activeTunnels.get(port)
+      if (existing && isAlive(existing.pid)) {
         return { content: [{ type: 'text', text: `Port ${port} is already shared at ${existing.url}` }] }
       }
 
-      const totalActive = tunnels.size + serverTunnels.size
-      if (totalActive >= MAX_TUNNELS) {
-        const active = [...tunnels.keys(), ...serverTunnels.keys()].join(', ')
+      const alive = [...activeTunnels.values()].filter(t => isAlive(t.pid))
+      if (alive.length >= MAX_TUNNELS) {
+        const ports = alive.map(t => t.port).join(', ')
         return {
-          content: [{
-            type: 'text',
-            text: `You already have ${totalActive} active tunnel(s) on port(s) ${active}. Stop one first with stop_sharing, or upgrade your sidedoor plan for more tunnels.`,
-          }],
+          content: [{ type: 'text', text: `You already have ${alive.length} active tunnel(s) on port(s) ${ports}. Stop one first or upgrade your sidedoor plan for more tunnels.` }],
           isError: true,
         }
       }
 
       try {
         const url = await startTunnel(port)
-        return {
-          content: [{
-            type: 'text',
-            text: `Your app is live at ${url}\n\nAnyone with this link can access your local server on port ${port}.`,
-          }],
-        }
+        return { content: [{ type: 'text', text: `Your app is live at ${url}\n\nAnyone with this link can access your local server on port ${port}.` }] }
       } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Failed to start tunnel: ${err instanceof Error ? err.message : 'unknown error'}` }],
-          isError: true,
-        }
+        return { content: [{ type: 'text', text: `Failed to start tunnel: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true }
       }
     }
 
     case 'stop_sharing': {
       const port = args?.port as number
+      const tunnel = activeTunnels.get(port)
+      if (!tunnel) return { content: [{ type: 'text', text: `No active tunnel on port ${port}` }] }
 
-      const tunnel = tunnels.get(port)
-      if (tunnel) {
-        tunnel.process.kill()
-        tunnels.delete(port)
-        await sleep(1500)
-        return { content: [{ type: 'text', text: `Stopped sharing port ${port}` }] }
-      }
-
-      const st = serverTunnels.get(port)
-      if (st) {
-        st.tunnelProcess.kill()
-        st.serverProcess.kill()
-        serverTunnels.delete(port)
-        await sleep(1500)
-        return { content: [{ type: 'text', text: `Stopped server and tunnel on port ${port}` }] }
-      }
-
-      return { content: [{ type: 'text', text: `No active tunnel on port ${port}` }] }
+      killPid(tunnel.pid)
+      if (tunnel.process) tunnel.process.kill()
+      activeTunnels.delete(port)
+      saveState()
+      await sleep(1500)
+      return { content: [{ type: 'text', text: `Stopped sharing port ${port}` }] }
     }
 
     case 'stop_all': {
       let count = 0
-      for (const [port, t] of tunnels) {
-        t.process.kill()
-        tunnels.delete(port)
+      for (const [port, t] of activeTunnels) {
+        killPid(t.pid)
+        if (t.process) t.process.kill()
+        activeTunnels.delete(port)
         count++
       }
-      for (const [port, st] of serverTunnels) {
-        st.tunnelProcess.kill()
-        st.serverProcess.kill()
-        serverTunnels.delete(port)
-        count++
-      }
+      saveState()
+      if (count > 0) await sleep(1500)
       return { content: [{ type: 'text', text: count > 0 ? `Stopped ${count} tunnel(s)` : 'No active tunnels' }] }
     }
 
     case 'list_tunnels': {
-      const all = [
-        ...Array.from(tunnels.entries()).map(([port, t]) => `  port ${port} → ${t.url}`),
-        ...Array.from(serverTunnels.entries()).map(([port, st]) => `  port ${port} → ${st.url} (server + tunnel)`),
-      ]
-      if (all.length === 0) {
-        return { content: [{ type: 'text', text: 'No active tunnels' }] }
-      }
-      return { content: [{ type: 'text', text: `Active tunnels:\n${all.join('\n')}` }] }
+      const alive = [...activeTunnels.values()].filter(t => isAlive(t.pid))
+      if (alive.length === 0) return { content: [{ type: 'text', text: 'No active tunnels' }] }
+      const lines = alive.map(t => `  port ${t.port} → ${t.url}`).join('\n')
+      return { content: [{ type: 'text', text: `Active tunnels:\n${lines}` }] }
     }
 
     case 'start_server_and_tunnel': {
@@ -223,24 +219,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const port = args?.port as number
       const waitMs = (args?.wait_ms as number) ?? 2000
 
-      if (tunnels.has(port) || serverTunnels.has(port)) {
-        const existing = tunnels.get(port) || serverTunnels.get(port)!
+      const existing = activeTunnels.get(port)
+      if (existing && isAlive(existing.pid)) {
         return { content: [{ type: 'text', text: `Port ${port} is already in use at ${existing.url}` }] }
       }
 
-      try {
-        const result = await startServerAndTunnel(command, port, waitMs)
+      const alive = [...activeTunnels.values()].filter(t => isAlive(t.pid))
+      if (alive.length >= MAX_TUNNELS) {
+        const ports = alive.map(t => t.port).join(', ')
         return {
-          content: [{
-            type: 'text',
-            text: `Server started and live at ${result.url}\n\nCommand: ${command}\nPort: ${port}\n\nAnyone with this link can access your app.`,
-          }],
-        }
-      } catch (err) {
-        return {
-          content: [{ type: 'text', text: `Failed: ${err instanceof Error ? err.message : 'unknown error'}` }],
+          content: [{ type: 'text', text: `You already have ${alive.length} active tunnel(s) on port(s) ${ports}. Stop one first or upgrade your plan.` }],
           isError: true,
         }
+      }
+
+      try {
+        const url = await startServerAndTunnel(command, port, waitMs)
+        return { content: [{ type: 'text', text: `Server started and live at ${url}\n\nCommand: ${command}\nPort: ${port}` }] }
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Failed: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true }
       }
     }
 
@@ -249,16 +246,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 })
 
+// ---- Process management ----
+
+function killPid(pid: number) {
+  try { process.kill(pid, 'SIGTERM') } catch {}
+  setTimeout(() => {
+    try { if (isAlive(pid)) process.kill(pid, 'SIGKILL') } catch {}
+  }, 2000)
+}
+
 function startTunnel(port: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    const proc = spawn('sidedoor', [String(port)], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const bin = findBinary()
+    const proc = spawn(bin, [String(port)], { stdio: ['ignore', 'pipe', 'pipe'] })
 
     let resolved = false
     const timeout = setTimeout(() => {
-      if (!resolved) {
-        proc.kill()
-        reject(new Error('timed out waiting for tunnel URL'))
-      }
+      if (!resolved) { proc.kill(); reject(new Error('timed out waiting for tunnel URL')) }
     }, 15_000)
 
     const onData = (data: Buffer) => {
@@ -268,7 +272,8 @@ function startTunnel(port: number): Promise<string> {
         resolved = true
         clearTimeout(timeout)
         const url = match[1]
-        tunnels.set(port, { process: proc, url, port })
+        activeTunnels.set(port, { pid: proc.pid!, url, port, process: proc })
+        saveState()
         resolve(url)
       }
     }
@@ -277,78 +282,28 @@ function startTunnel(port: number): Promise<string> {
     proc.stderr?.on('data', onData)
 
     proc.on('error', (err) => {
-      if (!resolved) {
-        clearTimeout(timeout)
-        reject(new Error(`sidedoor not found — run: npm install -g @sidedoor/cli\n${err.message}`))
-      }
+      if (!resolved) { clearTimeout(timeout); reject(new Error(`sidedoor not found — run: npm install -g @sidedoor/cli\n${err.message}`)) }
     })
 
-    proc.on('exit', (code) => {
-      tunnels.delete(port)
-      if (!resolved) {
-        clearTimeout(timeout)
-        reject(new Error(`sidedoor exited with code ${code}`))
-      }
+    proc.on('exit', () => {
+      activeTunnels.delete(port)
+      saveState()
+      if (!resolved) { clearTimeout(timeout); reject(new Error('sidedoor exited unexpectedly')) }
     })
   })
 }
 
-function startServerAndTunnel(command: string, port: number, waitMs: number): Promise<{ url: string }> {
+function startServerAndTunnel(command: string, port: number, waitMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    const opts: SpawnOptions = { stdio: ['ignore', 'pipe', 'pipe'], shell: true }
-    const serverProc = spawn(command, [], opts)
-
+    const serverProc = spawn(command, [], { stdio: ['ignore', 'pipe', 'pipe'], shell: true } as SpawnOptions)
     serverProc.on('error', (err) => reject(new Error(`Failed to start server: ${err.message}`)))
 
     setTimeout(async () => {
       try {
-        const url = await new Promise<string>((res, rej) => {
-          const proc = spawn('sidedoor', [String(port)], { stdio: ['ignore', 'pipe', 'pipe'] })
-
-          let resolved = false
-          const timeout = setTimeout(() => {
-            if (!resolved) {
-              proc.kill()
-              serverProc.kill()
-              rej(new Error('timed out waiting for tunnel URL'))
-            }
-          }, 15_000)
-
-          const onData = (data: Buffer) => {
-            const text = data.toString()
-            const match = text.match(/Public\s+(https?:\/\/\S+)/)
-            if (match && !resolved) {
-              resolved = true
-              clearTimeout(timeout)
-              res(match[1])
-            }
-          }
-
-          proc.stdout?.on('data', onData)
-          proc.stderr?.on('data', onData)
-
-          proc.on('error', (err) => {
-            if (!resolved) {
-              clearTimeout(timeout)
-              serverProc.kill()
-              rej(new Error(`sidedoor not found — run: npm install -g @sidedoor/cli\n${err.message}`))
-            }
-          })
-
-          proc.on('exit', (code) => {
-            if (!resolved) {
-              clearTimeout(timeout)
-              rej(new Error(`sidedoor exited with code ${code}`))
-            }
-          })
-
-          serverTunnels.set(port, { serverProcess: serverProc, tunnelProcess: proc, url: '', port })
-        })
-
-        const st = serverTunnels.get(port)
-        if (st) st.url = url
-        resolve({ url })
+        const url = await startTunnel(port)
+        resolve(url)
       } catch (err) {
+        serverProc.kill()
         reject(err)
       }
     }, waitMs)
