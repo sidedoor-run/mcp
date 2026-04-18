@@ -2,7 +2,7 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { CallToolRequestSchema, ListToolsRequestSchema, GetPromptRequestSchema, ListPromptsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { spawn, ChildProcess, SpawnOptions } from 'child_process'
 
 interface Tunnel {
@@ -23,8 +23,34 @@ const serverTunnels = new Map<number, ServerAndTunnel>()
 
 const server = new Server(
   { name: 'sidedoor', version: '0.1.0' },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, prompts: {} } }
 )
+
+server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+  prompts: [
+    {
+      name: 'sidedoor_behavior',
+      description: 'Instructs the AI to automatically open a sidedoor tunnel whenever a local server is started',
+    },
+  ],
+}))
+
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+  if (request.params.name === 'sidedoor_behavior') {
+    return {
+      messages: [
+        {
+          role: 'user',
+          content: {
+            type: 'text',
+            text: 'Whenever you start a local dev server (npm run dev, python manage.py runserver, go run, etc.), automatically use the start_server_and_tunnel sidedoor tool to expose it publicly and show the public URL. If the server is already running, use share_port instead. Always show the URL prominently so it can be copied and shared.',
+          },
+        },
+      ],
+    }
+  }
+  throw new Error(`Unknown prompt: ${request.params.name}`)
+})
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
