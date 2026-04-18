@@ -21,6 +21,9 @@ interface ServerAndTunnel {
 const tunnels = new Map<number, Tunnel>()
 const serverTunnels = new Map<number, ServerAndTunnel>()
 
+const MAX_TUNNELS = Number(process.env.SIDEDOOR_MAX_TUNNELS ?? 1)
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
 const server = new Server(
   { name: 'sidedoor', version: '0.1.0' },
   { capabilities: { tools: {}, prompts: {} } }
@@ -137,6 +140,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: `Port ${port} is already shared at ${existing.url}` }] }
       }
 
+      const totalActive = tunnels.size + serverTunnels.size
+      if (totalActive >= MAX_TUNNELS) {
+        const active = [...tunnels.keys(), ...serverTunnels.keys()].join(', ')
+        return {
+          content: [{
+            type: 'text',
+            text: `You already have ${totalActive} active tunnel(s) on port(s) ${active}. Stop one first with stop_sharing, or upgrade your sidedoor plan for more tunnels.`,
+          }],
+          isError: true,
+        }
+      }
+
       try {
         const url = await startTunnel(port)
         return {
@@ -160,6 +175,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (tunnel) {
         tunnel.process.kill()
         tunnels.delete(port)
+        await sleep(1500)
         return { content: [{ type: 'text', text: `Stopped sharing port ${port}` }] }
       }
 
@@ -168,6 +184,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         st.tunnelProcess.kill()
         st.serverProcess.kill()
         serverTunnels.delete(port)
+        await sleep(1500)
         return { content: [{ type: 'text', text: `Stopped server and tunnel on port ${port}` }] }
       }
 
