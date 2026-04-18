@@ -1,0 +1,29 @@
+{
+  "name": "@sidedoor/mcp",
+  "version": "0.1.0",
+  "description": "MCP server for sidedoor — lets Claude Code share your localhost",
+  "bin": {
+    "sidedoor-mcp": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node src/index.ts",
+    "prepublishOnly": "pnpm build"
+  },
+  "keywords": ["mcp", "tunnel", "localhost", "sidedoor", "claude"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
