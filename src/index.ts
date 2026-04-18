@@ -64,7 +64,7 @@ interface ActiveTunnel {
 }
 
 const activeTunnels = new Map<number, ActiveTunnel>()
-const MAX_TUNNELS = Number(process.env.SIDEDOOR_MAX_TUNNELS ?? 1)
+const MAX_TUNNELS = Number(process.env.SIDEDOOR_MAX_TUNNELS ?? 10)
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 loadState()
