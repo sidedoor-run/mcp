@@ -164,18 +164,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: `Port ${port} is already shared at ${existing.url}` }] }
       }
 
+      // Stop any other active tunnels first — relay only supports one tunnel per account
       const alive = [...activeTunnels.values()].filter(t => isAlive(t.pid))
-      if (alive.length >= MAX_TUNNELS) {
-        const ports = alive.map(t => t.port).join(', ')
-        return {
-          content: [{ type: 'text', text: `You already have ${alive.length} active tunnel(s) on port(s) ${ports}. Stop one first or upgrade your sidedoor plan for more tunnels.` }],
-          isError: true,
+      const stopped: string[] = []
+      if (alive.length > 0) {
+        for (const t of alive) {
+          stopped.push(`port ${t.port} (${t.url})`)
+          killPid(t.pid)
+          if (t.process) t.process.kill()
+          activeTunnels.delete(t.port)
         }
+        saveState()
+        await sleep(500)
       }
 
       try {
         const url = await startTunnel(port)
-        return { content: [{ type: 'text', text: `Your app is live at ${url}\n\nAnyone with this link can access your local server on port ${port}.` }] }
+        const lines: string[] = []
+        if (stopped.length > 0) {
+          lines.push(`Stopped: ${stopped.join(', ')}`)
+        }
+        lines.push(`Your app is live at ${url}`)
+        lines.push(`Anyone with this link can access your local server on port ${port}.`)
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
       } catch (err) {
         return { content: [{ type: 'text', text: `Failed to start tunnel: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true }
       }
@@ -224,18 +235,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: `Port ${port} is already in use at ${existing.url}` }] }
       }
 
+      // Stop any other active tunnels first — relay only supports one tunnel per account
       const alive = [...activeTunnels.values()].filter(t => isAlive(t.pid))
-      if (alive.length >= MAX_TUNNELS) {
-        const ports = alive.map(t => t.port).join(', ')
-        return {
-          content: [{ type: 'text', text: `You already have ${alive.length} active tunnel(s) on port(s) ${ports}. Stop one first or upgrade your plan.` }],
-          isError: true,
+      const stopped: string[] = []
+      if (alive.length > 0) {
+        for (const t of alive) {
+          stopped.push(`port ${t.port} (${t.url})`)
+          killPid(t.pid)
+          if (t.process) t.process.kill()
+          activeTunnels.delete(t.port)
         }
+        saveState()
+        await sleep(500)
       }
 
       try {
         const url = await startServerAndTunnel(command, port, waitMs)
-        return { content: [{ type: 'text', text: `Server started and live at ${url}\n\nCommand: ${command}\nPort: ${port}` }] }
+        const lines: string[] = []
+        if (stopped.length > 0) {
+          lines.push(`Stopped: ${stopped.join(', ')}`)
+        }
+        lines.push(`Server started and live at ${url}`)
+        lines.push(`Command: ${command}\nPort: ${port}`)
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
       } catch (err) {
         return { content: [{ type: 'text', text: `Failed: ${err instanceof Error ? err.message : 'unknown error'}` }], isError: true }
       }
